@@ -1,0 +1,164 @@
+#2d to 3d structures
+from pathlib import Path
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+RAW_DIR = Path(".")
+OUT_DIR = Path("./glycans_processed")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+GLYCAN_FILES = [
+    "slex.sdf",
+    "alphs26_sialylated.sdf",
+    "core_fucosylated.sdf"
+]
+
+
+def optimize_molecule(mol, file_name: str) -> None:
+    try:
+        if AllChem.MMFFHasAllMoleculeParams(mol):
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=1000)
+        else:
+            AllChem.UFFOptimizeMolecule(mol, maxIters=1000)
+    except Exception as e:
+        print(f"[WARNING] Optimization failed for {file_name}: {e}")
+
+
+def embed_with_etkdg(mol):
+    params = AllChem.ETKDGv3()
+    params.randomSeed = 42
+    params.useRandomCoords = True
+    params.maxAttempts = 2000
+    return AllChem.EmbedMolecule(mol, params)
+
+
+def embed_with_basic(mol):
+    return AllChem.EmbedMolecule(
+        mol,
+        maxAttempts=2000,
+        randomSeed=42,
+        useRandomCoords=True
+    )
+
+
+def prepare_glycan(file_name: str) -> None:
+    input_path = RAW_DIR / file_name
+    output_path = OUT_DIR / file_name.replace(".sdf", "_3d.sdf")
+
+    if not input_path.exists():
+        print(f"[ERROR] File not found: {input_path}")
+        return
+
+    mol = Chem.MolFromMolFile(str(input_path), removeHs=False)
+    if mol is None:
+        print(f"[ERROR] Could not read {file_name}")
+        return
+
+    try:
+        Chem.AssignStereochemistry(mol, force=True, cleanIt=True)
+    except Exception as e:
+        print(f"[WARNING] Stereochemistry assignment issue in {file_name}: {e}")
+
+    mol = Chem.AddHs(mol)
+
+    status = embed_with_etkdg(mol)
+
+    if status != 0:
+        print(f"[WARNING] ETKDG failed for {file_name}, trying basic embedding...")
+        status = embed_with_basic(mol)
+
+    if status != 0:
+        print(f"[WARNING] Basic embedding failed for {file_name}, trying without stereochemistry cleanup...")
+        mol = Chem.MolFromMolFile(str(input_path), removeHs=False, sanitize=False)
+        if mol is None:
+            print(f"[ERROR] Could not reload {file_name} with sanitize=False")
+            return
+
+        try:
+            Chem.SanitizeMol(mol)
+        except Exception as e:
+            print(f"[WARNING] Sanitization warning for {file_name}: {e}")
+
+        mol = Chem.AddHs(mol)
+        status = embed_with_basic(mol)
+
+    if status != 0:
+        print(f"[ERROR] 3D embedding failed for {file_name}")
+        return
+
+    optimize_molecule(mol, file_name)
+
+    Chem.MolToMolFile(mol, str(output_path))
+    print(f"[OK] Processed: {file_name} -> {output_path}")
+
+
+for glycan_file in GLYCAN_FILES:
+    prepare_glycan(glycan_file)
+
+
+#generation of conformers
+from pathlib import Path
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+IN_DIR = Path("./glycans_processed")
+OUT_DIR = Path("./glycans_processed")
+NUM_CONFS = 20
+
+GLYCANS = [
+    "slex_3d.sdf",
+    "alphs26_sialylated_3d.sdf",
+    "core_fucosylated_3d.sdf"
+]
+
+def generate_conformers(file_name: str, num_confs: int = 20) -> None:
+    input_path = IN_DIR / file_name
+    output_path = OUT_DIR / file_name.replace("_3d.sdf", "_conformers.sdf")
+
+    if not input_path.exists():
+        print(f"[ERROR] File not found: {input_path}")
+        return
+
+    suppl = Chem.SDMolSupplier(str(input_path), removeHs=False)
+    mol = None
+
+    for m in suppl:
+        if m is not None:
+            mol = m
+            break
+
+    if mol is None:
+        print(f"[ERROR] Could not load {file_name}")
+        return
+
+    mol = Chem.AddHs(mol)
+
+    params = AllChem.ETKDGv3()
+    params.randomSeed = 42
+    params.useRandomCoords = True
+
+    conf_ids = AllChem.EmbedMultipleConfs(mol, numConfs=num_confs, params=params)
+
+    if len(conf_ids) == 0:
+        print(f"[ERROR] No conformers generated for {file_name}")
+        return
+
+    for cid in conf_ids:
+        try:
+            if AllChem.MMFFHasAllMoleculeParams(mol):
+                AllChem.MMFFOptimizeMolecule(mol, confId=cid)
+            else:
+                AllChem.UFFOptimizeMolecule(mol, confId=cid)
+        except Exception as e:
+            print(f"[WARNING] Optimization failed for conformer {cid} in {file_name}: {e}")
+
+    writer = Chem.SDWriter(str(output_path))
+    for cid in conf_ids:
+        writer.write(mol, confId=cid)
+    writer.close()
+
+    print(f"[OK] Saved {len(conf_ids)} conformers to {output_path}")
+
+if __name__ == "__main__":
+    for glycan in GLYCANS:
+        generate_conformers(glycan, NUM_CONFS)
